@@ -317,10 +317,39 @@ def search(query, repo_filter, langs, path_glob, limit, threshold, output_format
     from codesearch.searcher import Searcher
 
     repos = storage.list_repos()
-    has_index = any(repo.chunk_count > 0 for repo in repos)
     prefers_json = output_format == "json" or (
         output_format == "auto" and not click.get_text_stream("stdout").isatty()
     )
+    if not repos:
+        _echo_if_not_quiet(ctx, "[]" if prefers_json else "Index is empty. Run codesearch index first.")
+        return
+
+    if repo_filter is None:
+        cwd = Path.cwd().resolve()
+        matching_repos = []
+        for repo in repos:
+            repo_path = Path(repo.path).resolve()
+            if cwd.is_relative_to(repo_path):
+                matching_repos.append((len(repo_path.parts), repo))
+        if not matching_repos:
+            message = "No registered repository found for current directory."
+            if prefers_json:
+                if not ctx.obj["quiet"]:
+                    click.echo(message, err=True)
+                _echo_if_not_quiet(ctx, "[]")
+            else:
+                _echo_if_not_quiet(ctx, message)
+            return
+        matching_repos.sort(key=lambda item: item[0], reverse=True)
+        selected_repo = matching_repos[0][1]
+        repo_filter = selected_repo.name
+        if path_glob is None:
+            repo_root = Path(selected_repo.path).resolve()
+            if cwd != repo_root:
+                relative_subdir = cwd.relative_to(repo_root).as_posix()
+                path_glob = f"{relative_subdir}/*"
+
+    has_index = any(repo.chunk_count > 0 for repo in repos)
     if not has_index:
         _echo_if_not_quiet(ctx, "[]" if prefers_json else "Index is empty. Run codesearch index first.")
         return
