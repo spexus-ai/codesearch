@@ -54,6 +54,7 @@ def test_e2e_repo_add_index_search_reindex_and_remove(tmp_path, monkeypatch) -> 
 
     add_result = runner.invoke(cli, ["--db", str(db_path), "--config", str(config_path), "repo", "add", str(repo_path)])
     index_result = runner.invoke(cli, ["--db", str(db_path), "--config", str(config_path), "index"])
+    monkeypatch.chdir(repo_path)
     search_alpha_result = runner.invoke(
         cli,
         ["--db", str(db_path), "--config", str(config_path), "search", "alpha query", "--format", "json"],
