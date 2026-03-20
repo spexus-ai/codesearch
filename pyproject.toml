@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codesearch"
+version = "0.1.0"
+description = "Semantic code search CLI powered by embeddings and sqlite-vec."
+requires-python = ">=3.11"
+dependencies = [
+  "click>=8.0",
+  "sqlite-vec>=0.1",
+  "tree-sitter>=0.22",
+  "sentence-transformers>=3.0",
+  "onnxruntime>=1.16",
+  "tomli-w>=1.0",
+]
+
+[project.optional-dependencies]
+local = [
+  "sentence-transformers>=3.0",
+  "onnxruntime>=1.16",
+]
+languages = [
+  "tree-sitter-python",
+  "tree-sitter-java",
+  "tree-sitter-javascript",
+  "tree-sitter-typescript",
+  "tree-sitter-go",
+  "tree-sitter-rust",
+  "tree-sitter-ruby",
+  "tree-sitter-cpp",
+  "tree-sitter-c",
+  "tree-sitter-kotlin",
+  "tree-sitter-php",
+  "tree-sitter-scala",
+  "tree-sitter-c-sharp",
+]
+ollama = ["httpx>=0.25"]
+openai = ["httpx>=0.25"]
+mcp = ["mcp>=1.0"]
+dev = ["pytest>=8.0"]
+all = ["codesearch[local,languages,ollama,openai,mcp,dev]"]
+
+[project.scripts]
+codesearch = "codesearch.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["codesearch*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
