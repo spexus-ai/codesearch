@@ -2,7 +2,9 @@
 
 Semantic code search CLI powered by embeddings and sqlite-vec.
 
-Index files from one or more repositories, store vector representations of code chunks in SQLite, and run fast semantic search from the command line. Agent-agnostic: works as a standalone CLI and integrates with any AI coding agent (Claude Code, Codex, OpenCode) via MCP protocol or pipe.
+AI coding agents (Claude Code, Codex, Cursor, etc.) spend a significant portion of their token budget just navigating the codebase — running grep, reading files, and guessing where the relevant code lives. codesearch solves this by pre-indexing your repositories into a vector database. Instead of scanning files one by one, the agent queries the index and gets relevant code chunks in one call — saving tokens and time.
+
+Works as a standalone CLI for developers and integrates with any AI coding agent via MCP protocol or pipe. Agent-agnostic: Claude Code, Codex, OpenCode, and others.
 
 ## Features
 
