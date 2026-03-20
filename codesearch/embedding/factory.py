@@ -3,6 +3,7 @@ from __future__ import annotations
 from codesearch.config import EmbeddingConfig
 from codesearch.embedding.base import EmbeddingProvider
 from codesearch.embedding.ollama import OllamaProvider
+from codesearch.embedding.onnx_direct import OnnxDirectProvider
 from codesearch.embedding.openai import OpenAIProvider
 from codesearch.embedding.openai_compatible import OpenAICompatibleProvider
 from codesearch.embedding.sentence_transformers import SentenceTransformersProvider
@@ -10,6 +11,8 @@ from codesearch.embedding.sentence_transformers import SentenceTransformersProvi
 
 def create_provider(config: EmbeddingConfig) -> EmbeddingProvider:
     match config.provider:
+        case "onnx":
+            return OnnxDirectProvider(model=config.model)
         case "sentence-transformers":
             return SentenceTransformersProvider(model=config.model, backend=config.backend)
         case "ollama":

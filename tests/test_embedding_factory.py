@@ -22,6 +22,17 @@ def test_embedding_provider_is_abstract() -> None:
         EmbeddingProvider()
 
 
+def test_factory_creates_onnx_direct_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(factory_module, "OnnxDirectProvider", DummyProvider)
+
+    provider = create_provider(
+        EmbeddingConfig(provider="onnx", model="all-MiniLM-L6-v2")
+    )
+
+    assert isinstance(provider, DummyProvider)
+    assert provider.kwargs == {"model": "all-MiniLM-L6-v2"}
+
+
 def test_factory_creates_sentence_transformers_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(factory_module, "SentenceTransformersProvider", DummyProvider)
 

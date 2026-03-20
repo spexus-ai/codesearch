@@ -4,22 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codesearch"
-version = "0.1.0"
+version = "0.2.0"
 description = "Semantic code search CLI powered by embeddings and sqlite-vec."
 requires-python = ">=3.11"
 dependencies = [
   "click>=8.0",
   "sqlite-vec>=0.1",
   "tree-sitter>=0.22",
-  "sentence-transformers>=3.0",
   "onnxruntime>=1.16",
+  "tokenizers>=0.15",
+  "huggingface-hub>=0.20",
+  "numpy>=1.24",
   "tomli-w>=1.0",
 ]
 
 [project.optional-dependencies]
 local = [
   "sentence-transformers>=3.0",
-  "onnxruntime>=1.16",
 ]
 languages = [
   "tree-sitter-python",
