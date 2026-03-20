@@ -28,7 +28,7 @@ KNOWN_KEYS = {
 
 @dataclass
 class EmbeddingConfig:
-    provider: str = "sentence-transformers"
+    provider: str = "onnx"
     model: str = "all-MiniLM-L6-v2"
     backend: str = "onnx"
     api_key: str | None = None

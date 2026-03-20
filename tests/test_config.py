@@ -16,7 +16,7 @@ def test_load_creates_default_config_file(tmp_path: Path) -> None:
     config = manager.load(path)
 
     assert path.exists()
-    assert config.embedding.provider == "sentence-transformers"
+    assert config.embedding.provider == "onnx"
     assert config.embedding.model == "all-MiniLM-L6-v2"
     assert config.embedding.backend == "onnx"
 
