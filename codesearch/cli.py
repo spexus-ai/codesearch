@@ -10,7 +10,8 @@ import click
 from codesearch import __version__
 from codesearch.config import ConfigManager
 from codesearch.errors import CodeSearchError
-from codesearch.formatter import auto_format, format_table
+from codesearch.formatter import auto_format, format_duplicates_json, format_duplicates_text, format_table
+from codesearch.lsh import SimHashLSH
 
 if TYPE_CHECKING:
     from codesearch.storage import Storage
@@ -101,6 +102,40 @@ def _resolve_repo(storage: "Storage", name_or_path: str):
         if repo.name == repo_text or repo.path == repo_path:
             return repo
     raise CodeSearchError('Repository not found. Use "codesearch repo add" first.')
+
+
+def _resolve_repo_from_cwd(storage: "Storage"):
+    cwd = Path.cwd().resolve()
+    matching_repos = []
+    for repo in storage.list_repos():
+        repo_path = Path(repo.path).resolve()
+        if cwd.is_relative_to(repo_path):
+            matching_repos.append((len(repo_path.parts), repo))
+    if not matching_repos:
+        return None, None
+    matching_repos.sort(key=lambda item: item[0], reverse=True)
+    selected_repo = matching_repos[0][1]
+    repo_root = Path(selected_repo.path).resolve()
+    if cwd == repo_root:
+        return selected_repo, None
+    relative_subdir = cwd.relative_to(repo_root).as_posix()
+    return selected_repo, f"{relative_subdir}/*"
+
+
+def _load_lsh_from_storage(storage: "Storage") -> SimHashLSH:
+    dimensions = storage.get_meta("embedding_dimensions")
+    if dimensions is None:
+        raise CodeSearchError("No indexed chunks found")
+    params = storage.load_lsh_params()
+    if params is None:
+        lsh = SimHashLSH(dim=int(dimensions))
+    else:
+        num_bands, band_width = params
+        lsh = SimHashLSH(num_bands=num_bands, band_width=band_width, dim=int(dimensions))
+    matrix_blob = storage.load_hyperplane_matrix()
+    if matrix_blob is not None:
+        lsh._matrix = lsh.deserialize_matrix(matrix_blob)
+    return lsh
 
 
 def _ensure_directory(path_text: str) -> Path:
@@ -288,6 +323,7 @@ def index(target, full, show_status):
                     f"scan={result.scan_seconds:.2f}s "
                     f"chunk={result.chunk_seconds:.2f}s "
                     f"embed={result.embed_seconds:.2f}s "
+                    f"lsh={result.lsh_seconds:.2f}s "
                     f"store={result.store_seconds:.2f}s"
                 )
 
@@ -325,13 +361,8 @@ def search(query, repo_filter, langs, path_glob, limit, threshold, output_format
         return
 
     if repo_filter is None:
-        cwd = Path.cwd().resolve()
-        matching_repos = []
-        for repo in repos:
-            repo_path = Path(repo.path).resolve()
-            if cwd.is_relative_to(repo_path):
-                matching_repos.append((len(repo_path.parts), repo))
-        if not matching_repos:
+        selected_repo, cwd_path_glob = _resolve_repo_from_cwd(storage)
+        if selected_repo is None:
             message = "No registered repository found for current directory."
             if prefers_json:
                 if not ctx.obj["quiet"]:
@@ -340,14 +371,9 @@ def search(query, repo_filter, langs, path_glob, limit, threshold, output_format
             else:
                 _echo_if_not_quiet(ctx, message)
             return
-        matching_repos.sort(key=lambda item: item[0], reverse=True)
-        selected_repo = matching_repos[0][1]
         repo_filter = selected_repo.name
         if path_glob is None:
-            repo_root = Path(selected_repo.path).resolve()
-            if cwd != repo_root:
-                relative_subdir = cwd.relative_to(repo_root).as_posix()
-                path_glob = f"{relative_subdir}/*"
+            path_glob = cwd_path_glob
 
     has_index = any(repo.chunk_count > 0 for repo in repos)
     if not has_index:
@@ -381,6 +407,83 @@ def search(query, repo_filter, langs, path_glob, limit, threshold, output_format
     else:
         rendered = auto_format(results, context_lines=context, repo_paths=repo_paths)
     click.echo(rendered)
+
+
+@cli.command()
+@click.option("--repo", "repo_filters", multiple=True, help="Filter by repository (repeatable).")
+@click.option("--path", "path_filters", multiple=True, help="Filter by file path glob (repeatable).")
+@click.option("--cross-file-only", is_flag=True, help="Only return cross-file duplicates.")
+@click.option("--threshold", type=float, default=0.82, show_default=True, help="Minimum similarity.")
+@click.option("--limit", type=int, default=50, show_default=True, help="Maximum number of pairs.")
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["auto", "text", "json"]),
+    default="auto",
+    show_default=True,
+    help="Output format.",
+)
+@handle_errors
+def duplicates(repo_filters, path_filters, cross_file_only, threshold, limit, output_format):
+    """Find semantic duplicate chunks."""
+    ctx = click.get_current_context()
+    storage = _get_storage(ctx)
+    from codesearch.duplicates import DuplicateFinder
+
+    repos = storage.list_repos()
+    prefers_json = output_format == "json" or (
+        output_format == "auto" and not click.get_text_stream("stdout").isatty()
+    )
+    if not repos or not any(repo.chunk_count > 0 for repo in repos):
+        _echo_if_not_quiet(ctx, "[]" if prefers_json else "No indexed chunks found")
+        return
+
+    repo_names = list(repo_filters)
+    path_globs = list(path_filters)
+    if not repo_names and not path_globs:
+        selected_repo, cwd_path_glob = _resolve_repo_from_cwd(storage)
+        if selected_repo is None:
+            message = "No registered repository found for current directory."
+            if prefers_json:
+                if not ctx.obj["quiet"]:
+                    click.echo(message, err=True)
+                _echo_if_not_quiet(ctx, "[]")
+            else:
+                _echo_if_not_quiet(ctx, message)
+            return
+        repo_names = [selected_repo.name]
+        if cwd_path_glob is not None:
+            path_globs = [cwd_path_glob]
+
+    repo_ids = [_resolve_repo(storage, item).id for item in repo_names] or None
+
+    if not storage.has_chunk_bands():
+        _echo_if_not_quiet(
+            ctx,
+            "[]" if prefers_json else "No LSH bands found. Re-index with: codesearch index --full",
+        )
+        return
+
+    finder = DuplicateFinder(
+        storage=storage,
+        lsh=_load_lsh_from_storage(storage),
+    )
+    pairs = finder.find_duplicates(
+        repo_ids=repo_ids,
+        path_globs=path_globs or None,
+        cross_file_only=cross_file_only,
+        threshold=threshold,
+        limit=limit,
+    )
+    if not pairs:
+        _echo_if_not_quiet(ctx, "[]" if prefers_json else "No duplicates found")
+        return
+    if ctx.obj["quiet"]:
+        return
+    if output_format == "json" or (output_format == "auto" and prefers_json):
+        click.echo(format_duplicates_json(pairs))
+        return
+    click.echo(format_duplicates_text(pairs))
 
 
 @cli.group("config")

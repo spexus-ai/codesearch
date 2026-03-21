@@ -9,6 +9,7 @@ Use this skill when you need to search code semantically across indexed reposito
 - Locating related code: "find all Kafka consumer handlers"
 - Discovering patterns: "show me error handling examples"
 - Finding tests: "tests for the user registration flow"
+- Finding duplicates: "are there copy-pasted services across repos?"
 
 ## Prerequisites
 
@@ -78,6 +79,54 @@ codesearch search "query" --no-snippet
     "score": 0.82,
     "snippet": "class AuthMiddleware:\n    def process_request(self, request):\n        ...",
     "lang": "python"
+  }
+]
+```
+
+### Duplicate detection
+
+```bash
+# Find semantic duplicates across all indexed repos
+codesearch duplicates --repo myapp
+
+# Cross-file only (skip duplicates within the same file)
+codesearch duplicates --repo myapp --cross-file-only
+
+# Across multiple repos
+codesearch duplicates --repo app --repo lib
+
+# Filter by path
+codesearch duplicates --path "*/utils/*"
+
+# Adjust similarity threshold (default: 0.82)
+codesearch duplicates --threshold 0.90
+
+# JSON output
+codesearch duplicates --repo myapp --format json
+```
+
+#### Duplicates JSON output schema
+
+```json
+[
+  {
+    "chunk_a": {
+      "repo": "myapp",
+      "path": "src/services/user_service.py",
+      "line_start": 10,
+      "line_end": 45,
+      "snippet": "class UserService:\n    ...",
+      "lang": "python"
+    },
+    "chunk_b": {
+      "repo": "myapp",
+      "path": "src/services/order_service.py",
+      "line_start": 10,
+      "line_end": 45,
+      "snippet": "class OrderService:\n    ...",
+      "lang": "python"
+    },
+    "similarity": 0.92
   }
 ]
 ```

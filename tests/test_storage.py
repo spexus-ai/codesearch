@@ -48,10 +48,12 @@ def test_storage_initializes_schema_on_first_use(tmp_path: Path) -> None:
     assert "meta" in tables
     assert "repos" in tables
     assert "chunks" in tables
+    assert "chunk_bands" in tables
     assert "vec_chunks" in tables
     assert "idx_chunks_repo" in tables
     assert "idx_chunks_file" in tables
     assert "idx_chunks_lang" in tables
+    assert "idx_band_lookup" in tables
     assert "USING vec0" in vec_sql
     assert "embedding float[768]" in vec_sql
 
@@ -245,6 +247,115 @@ def test_get_changed_files_and_delete_chunks_for_files(tmp_path: Path) -> None:
     assert _row_count(db_path, "vec_chunks") == 1
     assert repos[0].file_count == 1
     assert repos[0].chunk_count == 1
+
+
+# Validates: REQ-755 (hyperplane matrix H and LSH params persist in meta)
+def test_storage_persists_lsh_metadata(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "index.db")
+
+    assert storage.load_hyperplane_matrix() is None
+    assert storage.load_lsh_params() is None
+
+    storage.save_hyperplane_matrix(b"\x00\x01\x02hyperplanes")
+    storage.save_lsh_params(num_bands=8, band_width=16)
+
+    assert storage.load_hyperplane_matrix() == b"\x00\x01\x02hyperplanes"
+    assert storage.load_lsh_params() == (8, 16)
+
+
+# Validates: REQ-754, REQ-757 (chunk_bands persistence, explicit cleanup, and SQL self-join candidate search)
+def test_chunk_bands_support_candidate_lookup_cleanup_and_embedding_load(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.db"
+    repo_a_path = tmp_path / "repo-a"
+    repo_b_path = tmp_path / "repo-b"
+    repo_a_path.mkdir()
+    repo_b_path.mkdir()
+    storage = Storage(db_path)
+    repo_a = storage.add_repo("repo-a", str(repo_a_path))
+    repo_b = storage.add_repo("repo-b", str(repo_b_path))
+
+    chunk_ids = storage.insert_chunks(
+        [
+            Chunk(
+                repo_id=repo_a,
+                file_path="src/a.py",
+                line_start=1,
+                line_end=2,
+                content="print('a')",
+                lang="python",
+                file_mtime=1.0,
+            ),
+            Chunk(
+                repo_id=repo_a,
+                file_path="src/b.py",
+                line_start=1,
+                line_end=2,
+                content="print('b')",
+                lang="python",
+                file_mtime=1.0,
+            ),
+            Chunk(
+                repo_id=repo_b,
+                file_path="lib/c.py",
+                line_start=1,
+                line_end=2,
+                content="print('c')",
+                lang="python",
+                file_mtime=1.0,
+            ),
+            Chunk(
+                repo_id=repo_b,
+                file_path="docs/d.md",
+                line_start=1,
+                line_end=2,
+                content="print('d')",
+                lang="markdown",
+                file_mtime=1.0,
+            ),
+        ],
+        [[1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.0, 1.0]],
+    )
+
+    storage.insert_chunk_bands(chunk_ids[0], [(0, b"band-a"), (1, b"band-x")])
+    storage.insert_chunk_bands(chunk_ids[1], [(0, b"band-a"), (1, b"band-y")])
+    storage.insert_chunk_bands(chunk_ids[2], [(0, b"band-a"), (1, b"band-x")])
+    storage.insert_chunk_bands(chunk_ids[3], [(0, b"band-z")])
+
+    assert _row_count(db_path, "chunk_bands") == 7
+    assert storage.find_duplicate_candidates(repo_ids=None, path_globs=None) == [
+        (chunk_ids[0], chunk_ids[1]),
+        (chunk_ids[0], chunk_ids[2]),
+        (chunk_ids[1], chunk_ids[2]),
+    ]
+    assert storage.find_duplicate_candidates(repo_ids=[repo_a], path_globs=None) == [
+        (chunk_ids[0], chunk_ids[1])
+    ]
+    assert storage.find_duplicate_candidates(repo_ids=None, path_globs=["src/*.py"]) == [
+        (chunk_ids[0], chunk_ids[1])
+    ]
+    assert storage.load_embeddings_for_chunks([chunk_ids[0], chunk_ids[2]]) == {
+        chunk_ids[0]: [1.0, 0.0],
+        chunk_ids[2]: [0.8, 0.2],
+    }
+
+    storage.delete_chunk_bands_for_files(repo_b, ["docs/d.md"])
+
+    assert _row_count(db_path, "chunk_bands") == 6
+    assert storage.find_duplicate_candidates(repo_ids=None, path_globs=None) == [
+        (chunk_ids[0], chunk_ids[1]),
+        (chunk_ids[0], chunk_ids[2]),
+        (chunk_ids[1], chunk_ids[2]),
+    ]
+
+    deleted = storage.delete_chunks_for_files(repo_a, ["src/a.py"])
+
+    assert deleted == 1
+    assert _row_count(db_path, "chunks") == 3
+    assert _row_count(db_path, "vec_chunks") == 3
+    assert _row_count(db_path, "chunk_bands") == 4
+    assert storage.find_duplicate_candidates(repo_ids=None, path_globs=None) == [
+        (chunk_ids[1], chunk_ids[2])
+    ]
 
 
 def test_search_supports_metadata_filters_and_threshold(tmp_path: Path) -> None:

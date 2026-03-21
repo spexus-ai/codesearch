@@ -29,6 +29,33 @@ def format_json(results: Sequence[object]) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def format_duplicates_text(pairs: Sequence[object]) -> str:
+    blocks: list[str] = []
+    for pair in pairs:
+        row = _row_to_mapping(pair)
+        chunk_a = dict(row["chunk_a"])
+        chunk_b = dict(row["chunk_b"])
+        header = (
+            f"{chunk_a['repo']}:{chunk_a['path']}:{chunk_a['line_start']}-{chunk_a['line_end']} <-> "
+            f"{chunk_b['repo']}:{chunk_b['path']}:{chunk_b['line_start']}-{chunk_b['line_end']} "
+            f"(score: {float(row['similarity']):.2f})"
+        )
+        snippet_a = _format_numbered_lines(
+            str(chunk_a["snippet"]).splitlines() or [str(chunk_a["snippet"])],
+            start_line=int(chunk_a["line_start"]),
+        )
+        snippet_b = _format_numbered_lines(
+            str(chunk_b["snippet"]).splitlines() or [str(chunk_b["snippet"])],
+            start_line=int(chunk_b["line_start"]),
+        )
+        blocks.append(f"{header}\nA:\n{snippet_a}\nB:\n{snippet_b}")
+    return "\n\n".join(blocks)
+
+
+def format_duplicates_json(pairs: Sequence[object]) -> str:
+    return format_json(pairs)
+
+
 def format_no_snippet(results: Sequence[object]) -> str:
     lines: list[str] = []
     for result in results:

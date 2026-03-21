@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -34,6 +35,17 @@ class Chunk:
     lang: str
     file_mtime: float
     id: int | None = None
+
+
+@dataclass(slots=True)
+class ChunkRecord:
+    id: int
+    repo: str
+    path: str
+    line_start: int
+    line_end: int
+    content: str
+    lang: str
 
 
 @dataclass(slots=True)
@@ -170,6 +182,16 @@ class Storage:
             with self._connect() as conn:
                 conn.execute(
                     f"""
+                    DELETE FROM chunk_bands
+                    WHERE chunk_id IN (
+                        SELECT id FROM chunks
+                        WHERE repo_id = ? AND file_path IN ({placeholders})
+                    )
+                    """,
+                    params,
+                )
+                conn.execute(
+                    f"""
                     DELETE FROM vec_chunks
                     WHERE chunk_id IN (
                         SELECT id FROM chunks
@@ -239,6 +261,233 @@ class Storage:
             raise self._storage_error(exc, f"Failed to insert chunks: {exc}") from exc
         except sqlite3.Error as exc:
             raise self._storage_error(exc, f"Failed to insert chunks: {exc}") from exc
+
+    def save_hyperplane_matrix(self, matrix_blob: bytes) -> None:
+        self._ensure_initialized()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO meta(key, value)
+                    VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    ("lsh_hyperplane_matrix", sqlite3.Binary(matrix_blob)),
+                )
+        except sqlite3.Error as exc:
+            raise self._storage_error(exc, f"Failed to write hyperplane matrix: {exc}") from exc
+
+    def load_hyperplane_matrix(self) -> bytes | None:
+        self._ensure_initialized()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    ("lsh_hyperplane_matrix",),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise self._storage_error(exc, f"Failed to read hyperplane matrix: {exc}") from exc
+        if row is None:
+            return None
+        value = row["value"]
+        if isinstance(value, bytes):
+            return value
+        return str(value).encode("utf-8")
+
+    def save_lsh_params(self, num_bands: int, band_width: int) -> None:
+        self._ensure_initialized()
+        try:
+            with self._connect() as conn:
+                self._set_meta_value(conn, "lsh_num_bands", str(num_bands))
+                self._set_meta_value(conn, "lsh_band_width", str(band_width))
+        except sqlite3.Error as exc:
+            raise self._storage_error(exc, f"Failed to write LSH params: {exc}") from exc
+
+    def load_lsh_params(self) -> tuple[int, int] | None:
+        self._ensure_initialized()
+        try:
+            with self._connect() as conn:
+                num_bands = self._get_meta_value(conn, "lsh_num_bands")
+                band_width = self._get_meta_value(conn, "lsh_band_width")
+        except sqlite3.Error as exc:
+            raise self._storage_error(exc, f"Failed to read LSH params: {exc}") from exc
+        if num_bands is None or band_width is None:
+            return None
+        return int(num_bands), int(band_width)
+
+    def insert_chunk_bands(self, chunk_id: int, bands: list[tuple[int, bytes]]) -> None:
+        self._ensure_initialized()
+        if not bands:
+            return
+        try:
+            with self._connect() as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO chunk_bands(chunk_id, band_idx, band_hash)
+                    VALUES (?, ?, ?)
+                    """,
+                    [
+                        (chunk_id, band_idx, sqlite3.Binary(band_hash))
+                        for band_idx, band_hash in bands
+                    ],
+                )
+        except sqlite3.Error as exc:
+            raise self._storage_error(exc, f"Failed to insert chunk bands: {exc}") from exc
+
+    def delete_chunk_bands_for_files(self, repo_id: int, file_paths: list[str]) -> None:
+        self._ensure_initialized()
+        normalized = sorted({path for path in file_paths})
+        if not normalized:
+            return
+        placeholders = ", ".join("?" for _ in normalized)
+        params = [repo_id, *normalized]
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    f"""
+                    DELETE FROM chunk_bands
+                    WHERE chunk_id IN (
+                        SELECT id FROM chunks
+                        WHERE repo_id = ? AND file_path IN ({placeholders})
+                    )
+                    """,
+                    params,
+                )
+        except sqlite3.Error as exc:
+            raise self._storage_error(exc, f"Failed to delete chunk bands: {exc}") from exc
+
+    def clear_chunk_bands(self) -> None:
+        self._ensure_initialized()
+        try:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM chunk_bands")
+        except sqlite3.Error as exc:
+            raise self._storage_error(exc, f"Failed to clear chunk bands: {exc}") from exc
+
+    def has_chunk_bands(self) -> bool:
+        self._ensure_initialized()
+        try:
+            with self._connect() as conn:
+                row = conn.execute("SELECT COUNT(*) AS cnt FROM chunk_bands LIMIT 1").fetchone()
+        except sqlite3.Error as exc:
+            raise self._storage_error(exc, f"Failed to check chunk bands: {exc}") from exc
+        return row is not None and int(row["cnt"]) > 0
+
+    def find_duplicate_candidates(
+        self,
+        repo_ids: list[int] | None,
+        path_globs: list[str] | None,
+    ) -> list[tuple[int, int]]:
+        self._ensure_initialized()
+        if repo_ids is not None and not repo_ids:
+            return []
+        if path_globs is not None and not path_globs:
+            return []
+        normalized_repo_ids = sorted(set(repo_ids)) if repo_ids else None
+        normalized_path_globs = sorted(set(path_globs)) if path_globs else None
+        sql = [
+            """
+            SELECT DISTINCT
+                cb1.chunk_id AS chunk_id_a,
+                cb2.chunk_id AS chunk_id_b
+            FROM chunk_bands AS cb1
+            INNER JOIN chunk_bands AS cb2
+                ON cb1.band_idx = cb2.band_idx
+                AND cb1.band_hash = cb2.band_hash
+                AND cb1.chunk_id < cb2.chunk_id
+            INNER JOIN chunks AS c1 ON c1.id = cb1.chunk_id
+            INNER JOIN chunks AS c2 ON c2.id = cb2.chunk_id
+            WHERE 1 = 1
+            """
+        ]
+        params: list[Any] = []
+
+        if normalized_repo_ids:
+            placeholders = ", ".join("?" for _ in normalized_repo_ids)
+            sql.append(f"AND c1.repo_id IN ({placeholders})")
+            sql.append(f"AND c2.repo_id IN ({placeholders})")
+            params.extend(normalized_repo_ids)
+            params.extend(normalized_repo_ids)
+
+        if normalized_path_globs:
+            placeholders = " OR ".join("c1.file_path GLOB ?" for _ in normalized_path_globs)
+            sql.append(f"AND ({placeholders})")
+            placeholders = " OR ".join("c2.file_path GLOB ?" for _ in normalized_path_globs)
+            sql.append(f"AND ({placeholders})")
+            params.extend(normalized_path_globs)
+            params.extend(normalized_path_globs)
+
+        sql.append("ORDER BY chunk_id_a ASC, chunk_id_b ASC")
+
+        try:
+            with self._connect() as conn:
+                rows = conn.execute("\n".join(sql), params).fetchall()
+        except sqlite3.Error as exc:
+            raise self._storage_error(exc, f"Failed to find duplicate candidates: {exc}") from exc
+
+        return [(int(row["chunk_id_a"]), int(row["chunk_id_b"])) for row in rows]
+
+    def load_embeddings_for_chunks(self, chunk_ids: list[int]) -> dict[int, list[float]]:
+        self._ensure_initialized()
+        if not chunk_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in chunk_ids)
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT chunk_id, vec_to_json(embedding) AS embedding_json
+                    FROM vec_chunks
+                    WHERE chunk_id IN ({placeholders})
+                    """,
+                    chunk_ids,
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise self._storage_error(exc, f"Failed to load embeddings for chunks: {exc}") from exc
+
+        return {
+            int(row["chunk_id"]): [float(value) for value in json.loads(str(row["embedding_json"]))]
+            for row in rows
+        }
+
+    def load_chunk_records(self, chunk_ids: list[int]) -> dict[int, ChunkRecord]:
+        self._ensure_initialized()
+        if not chunk_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in chunk_ids)
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT
+                        chunks.id AS chunk_id,
+                        repos.name AS repo_name,
+                        chunks.file_path AS file_path,
+                        chunks.line_start AS line_start,
+                        chunks.line_end AS line_end,
+                        chunks.content AS content,
+                        chunks.lang AS lang
+                    FROM chunks
+                    INNER JOIN repos ON repos.id = chunks.repo_id
+                    WHERE chunks.id IN ({placeholders})
+                    """,
+                    chunk_ids,
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise self._storage_error(exc, f"Failed to load chunk records: {exc}") from exc
+
+        return {
+            int(row["chunk_id"]): ChunkRecord(
+                id=int(row["chunk_id"]),
+                repo=str(row["repo_name"]),
+                path=str(row["file_path"]),
+                line_start=int(row["line_start"]),
+                line_end=int(row["line_end"]),
+                content=str(row["content"]),
+                lang=str(row["lang"] or ""),
+            )
+            for row in rows
+        }
 
     def search(
         self,
@@ -395,39 +644,7 @@ class Storage:
             return
         try:
             with self._connect() as conn:
-                conn.executescript(
-                    """
-                    CREATE TABLE IF NOT EXISTS meta (
-                        key TEXT PRIMARY KEY,
-                        value TEXT NOT NULL
-                    );
-
-                    CREATE TABLE IF NOT EXISTS repos (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT UNIQUE NOT NULL,
-                        path TEXT UNIQUE NOT NULL,
-                        indexed_at TEXT,
-                        file_count INTEGER NOT NULL DEFAULT 0,
-                        chunk_count INTEGER NOT NULL DEFAULT 0
-                    );
-
-                    CREATE TABLE IF NOT EXISTS chunks (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
-                        file_path TEXT NOT NULL,
-                        line_start INTEGER NOT NULL,
-                        line_end INTEGER NOT NULL,
-                        content TEXT NOT NULL,
-                        lang TEXT,
-                        file_mtime REAL NOT NULL,
-                        UNIQUE(repo_id, file_path, line_start)
-                    );
-
-                    CREATE INDEX IF NOT EXISTS idx_chunks_repo ON chunks(repo_id);
-                    CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(repo_id, file_path);
-                    CREATE INDEX IF NOT EXISTS idx_chunks_lang ON chunks(lang);
-                    """
-                )
+                self._init_schema(conn)
                 current_dimensions = self._get_meta_value(conn, "embedding_dimensions")
                 target_dimensions = (
                     int(current_dimensions) if current_dimensions is not None else DEFAULT_VECTOR_DIMENSIONS
@@ -590,6 +807,49 @@ class Storage:
             """
         )
         self._set_meta_value(conn, "vec_dimensions", str(dimensions))
+
+    def _init_schema(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS repos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                path TEXT UNIQUE NOT NULL,
+                indexed_at TEXT,
+                file_count INTEGER NOT NULL DEFAULT 0,
+                chunk_count INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+                file_path TEXT NOT NULL,
+                line_start INTEGER NOT NULL,
+                line_end INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                lang TEXT,
+                file_mtime REAL NOT NULL,
+                UNIQUE(repo_id, file_path, line_start)
+            );
+
+            CREATE TABLE IF NOT EXISTS chunk_bands (
+                chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+                band_idx INTEGER NOT NULL,
+                band_hash BLOB NOT NULL,
+                PRIMARY KEY (chunk_id, band_idx)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunks_repo ON chunks(repo_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(repo_id, file_path);
+            CREATE INDEX IF NOT EXISTS idx_chunks_lang ON chunks(lang);
+            CREATE INDEX IF NOT EXISTS idx_band_lookup ON chunk_bands(band_idx, band_hash);
+            """
+        )
 
     def _load_sqlite_vec(self, conn: sqlite3.Connection) -> None:
         try:
