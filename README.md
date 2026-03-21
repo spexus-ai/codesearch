@@ -13,6 +13,7 @@ Works as a standalone CLI for developers and integrates with any AI coding agent
 - **Incremental indexing** — only changed files are re-indexed
 - **Multiple embedding providers** — local (sentence-transformers + ONNX) or remote (OpenAI, Ollama, any OpenAI-compatible API)
 - **MCP server** for integration with AI coding agents
+- **Duplicate detection** — find semantic code duplicates within and across repositories via LSH
 - **Pipe-friendly** — JSON output for scripting, text output for humans
 
 ## Installation
@@ -100,6 +101,19 @@ Output format is auto-detected: text for TTY, JSON for pipes.
 ```bash
 # Pipe to jq
 codesearch search "error handling" | jq '.[].path'
+```
+
+### Duplicate detection
+
+```bash
+codesearch duplicates                             # find duplicates (auto-detect repo from CWD)
+codesearch duplicates --repo myapp                # within a single repo
+codesearch duplicates --repo myapp --cross-file-only  # only cross-file duplicates
+codesearch duplicates --repo app --repo lib       # across two repos
+codesearch duplicates --path "*/utils/*"           # filter by file path glob
+codesearch duplicates --threshold 0.90            # stricter similarity (default: 0.82)
+codesearch duplicates --limit 100                 # more results (default: 50)
+codesearch duplicates --format json               # JSON output
 ```
 
 ### Configuration
@@ -227,6 +241,8 @@ codesearch/
 ├── chunker.py           # tree-sitter AST + line fallback
 ├── indexer.py           # Indexing pipeline orchestrator
 ├── searcher.py          # Semantic search
+├── duplicates.py        # Duplicate detection engine
+├── lsh.py               # SimHash LSH for near-duplicate candidate retrieval
 ├── formatter.py         # Text / JSON / compact output
 ├── errors.py            # Exception hierarchy
 ├── mcp_server.py        # MCP stdio server

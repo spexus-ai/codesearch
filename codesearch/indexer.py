@@ -7,8 +7,9 @@ from typing import Callable
 import warnings
 
 from codesearch.chunker import Chunker
-from codesearch.errors import ChunkerError, StorageError
+from codesearch.errors import ChunkerError, DimensionMismatchError, StorageError
 from codesearch.embedding.base import EmbeddingProvider
+from codesearch.lsh import SimHashLSH
 from codesearch.scanner import FileScanner
 from codesearch.storage import Chunk, Storage
 
@@ -23,6 +24,7 @@ class IndexResult:
     scan_seconds: float
     chunk_seconds: float
     embed_seconds: float
+    lsh_seconds: float
     store_seconds: float
 
 
@@ -38,6 +40,47 @@ class Indexer:
         self.provider = provider
         self.scanner = scanner
         self.chunker = chunker
+        self.lsh, self._lsh_matrix_reset = self._initialize_lsh()
+
+    def _initialize_lsh(self) -> tuple[SimHashLSH, bool]:
+        dimensions = self.provider.dimensions()
+        stored_params = self.storage.load_lsh_params()
+        if stored_params is None:
+            lsh = SimHashLSH(dim=dimensions)
+            self.storage.save_lsh_params(num_bands=lsh.num_bands, band_width=lsh.band_width)
+        else:
+            num_bands, band_width = stored_params
+            lsh = SimHashLSH(num_bands=num_bands, band_width=band_width, dim=dimensions)
+
+        matrix_blob = self.storage.load_hyperplane_matrix()
+        if matrix_blob is None:
+            self.storage.save_hyperplane_matrix(lsh.serialize_matrix(lsh._matrix))
+            return lsh, False
+
+        matrix = lsh.deserialize_matrix(matrix_blob)
+        expected_shape = (lsh.num_bands * lsh.band_width, dimensions)
+        if matrix.shape != expected_shape:
+            lsh._matrix = lsh.generate_hyperplane_matrix()
+            return lsh, True
+
+        lsh._matrix = matrix
+        return lsh, False
+
+    def _prepare_lsh_for_indexing(self, *, full: bool) -> None:
+        stored_dimensions = self.storage.get_meta("embedding_dimensions")
+        dimension_mismatch = stored_dimensions is not None and int(stored_dimensions) != self.lsh.dim
+        if dimension_mismatch and not full:
+            raise DimensionMismatchError(
+                f"Index dimensions {stored_dimensions} do not match current embeddings {self.lsh.dim}. "
+                "Run index --full."
+            )
+        if not full:
+            return
+        if dimension_mismatch or self._lsh_matrix_reset:
+            self.storage.clear_chunk_bands()
+        if self._lsh_matrix_reset:
+            self.storage.save_hyperplane_matrix(self.lsh.serialize_matrix(self.lsh._matrix))
+            self._lsh_matrix_reset = False
 
     def index_repo(
         self,
@@ -49,6 +92,7 @@ class Indexer:
         repo_path = Path(repo_path).expanduser().resolve()
         if not repo_path.is_dir():
             raise StorageError(f"Repository directory not found: {repo_path}")
+        self._prepare_lsh_for_indexing(full=full)
 
         started_at = perf_counter()
 
@@ -65,6 +109,12 @@ class Indexer:
             changed_files = self.storage.get_changed_files(repo_id, scanned_files)
             delete_targets = sorted(set(changed_files) | set(removed_files))
 
+        chunk_band_delete_targets = delete_targets
+        if full and self._lsh_matrix_reset:
+            chunk_band_delete_targets = sorted(indexed_files)
+
+        if chunk_band_delete_targets:
+            self.storage.delete_chunk_bands_for_files(repo_id, chunk_band_delete_targets)
         if delete_targets:
             self.storage.delete_chunks_for_files(repo_id, delete_targets)
 
@@ -117,9 +167,15 @@ class Indexer:
             embeddings.extend(batch_embeddings)
         embed_seconds = perf_counter() - embed_started_at
 
+        lsh_started_at = perf_counter()
+        band_hashes = self.lsh.compute_band_hashes(embeddings)
+        lsh_seconds = perf_counter() - lsh_started_at
+
         store_started_at = perf_counter()
         if chunks:
-            self.storage.insert_chunks(chunks, embeddings)
+            chunk_ids = self.storage.insert_chunks(chunks, embeddings)
+            for chunk_id, chunk_bands in zip(chunk_ids, band_hashes, strict=True):
+                self.storage.insert_chunk_bands(chunk_id, chunk_bands)
         self.storage.refresh_repo(repo_id)
         store_seconds = perf_counter() - store_started_at
 
@@ -130,5 +186,6 @@ class Indexer:
             scan_seconds=scan_seconds,
             chunk_seconds=chunk_seconds,
             embed_seconds=embed_seconds,
+            lsh_seconds=lsh_seconds,
             store_seconds=store_seconds,
         )

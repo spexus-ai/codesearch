@@ -3,7 +3,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from codesearch.formatter import auto_format, format_json, format_no_snippet, format_table, format_text
+from codesearch.duplicates import ChunkInfo, DuplicatePair
+from codesearch.formatter import (
+    auto_format,
+    format_duplicates_json,
+    format_duplicates_text,
+    format_json,
+    format_no_snippet,
+    format_table,
+    format_text,
+)
 from codesearch.searcher import SearchResult
 
 
@@ -135,3 +144,34 @@ def test_format_table_aligns_columns() -> None:
     assert "Name       " in output
     assert "repo-a" in output
     assert "repo-long" in output
+
+
+def test_format_duplicates_text_and_json() -> None:
+    pair = DuplicatePair(
+        chunk_a=ChunkInfo(
+            repo="repo-a",
+            path="src/a.py",
+            line_start=1,
+            line_end=2,
+            snippet="def alpha():\n    return 1",
+            lang="python",
+        ),
+        chunk_b=ChunkInfo(
+            repo="repo-a",
+            path="src/b.py",
+            line_start=5,
+            line_end=6,
+            snippet="def beta():\n    return 1",
+            lang="python",
+        ),
+        similarity=0.99,
+    )
+
+    text_output = format_duplicates_text([pair])
+    json_output = json.loads(format_duplicates_json([pair]))
+
+    assert "repo-a:src/a.py:1-2 <-> repo-a:src/b.py:5-6 (score: 0.99)" in text_output
+    assert "A:" in text_output
+    assert "B:" in text_output
+    assert json_output[0]["chunk_a"]["path"] == "src/a.py"
+    assert json_output[0]["chunk_b"]["path"] == "src/b.py"

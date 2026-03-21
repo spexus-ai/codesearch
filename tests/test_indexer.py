@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from codesearch.chunker import Chunker
+from codesearch.errors import DimensionMismatchError
 from codesearch.indexer import Indexer
 from codesearch.scanner import FileScanner
 from codesearch.storage import Storage
@@ -18,7 +20,14 @@ class FakeEmbeddingProvider:
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         self.calls.append(list(texts))
-        return [[float(len(text)), float(index), float(self._dimensions)] for index, text in enumerate(texts)]
+        embeddings: list[list[float]] = []
+        for index, text in enumerate(texts):
+            base = [float(len(text)), float(index), float(self._dimensions)]
+            if self._dimensions <= len(base):
+                embeddings.append(base[: self._dimensions])
+                continue
+            embeddings.append(base + [0.0] * (self._dimensions - len(base)))
+        return embeddings
 
     def dimensions(self) -> int:
         return self._dimensions
@@ -27,6 +36,36 @@ class FakeEmbeddingProvider:
 class InterruptingEmbeddingProvider(FakeEmbeddingProvider):
     def embed(self, texts: list[str]) -> list[list[float]]:
         raise KeyboardInterrupt
+
+
+class TrackingStorage(Storage):
+    def __init__(self, db_path: Path):
+        super().__init__(db_path)
+        self.events: list[tuple[str, int, tuple[str, ...]]] = []
+        self.inserted_chunk_bands: list[tuple[int, list[tuple[int, bytes]]]] = []
+
+    def delete_chunk_bands_for_files(self, repo_id: int, file_paths: list[str]) -> None:
+        self.events.append(("delete_chunk_bands_for_files", repo_id, tuple(file_paths)))
+        super().delete_chunk_bands_for_files(repo_id, file_paths)
+
+    def clear_chunk_bands(self) -> None:
+        self.events.append(("clear_chunk_bands", 0, ()))
+        super().clear_chunk_bands()
+
+    def delete_chunks_for_files(self, repo_id: int, file_paths: list[str]) -> int:
+        self.events.append(("delete_chunks_for_files", repo_id, tuple(file_paths)))
+        return super().delete_chunks_for_files(repo_id, file_paths)
+
+    def insert_chunk_bands(self, chunk_id: int, bands: list[tuple[int, bytes]]) -> None:
+        self.inserted_chunk_bands.append((chunk_id, list(bands)))
+        super().insert_chunk_bands(chunk_id, bands)
+
+
+def _row_count(db_path: Path, table: str) -> int:
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+    assert row is not None
+    return int(row[0])
 
 
 def test_indexer_indexes_changed_files_in_batches_and_updates_storage(tmp_path: Path) -> None:
@@ -53,6 +92,7 @@ def test_indexer_indexes_changed_files_in_batches_and_updates_storage(tmp_path: 
     assert result.scan_seconds >= 0.0
     assert result.chunk_seconds >= 0.0
     assert result.embed_seconds >= 0.0
+    assert result.lsh_seconds >= 0.0
     assert result.store_seconds >= 0.0
     assert storage.get_meta("embedding_dimensions") == "3"
     assert [len(call) for call in provider.calls] == [32, 1]
@@ -192,3 +232,120 @@ def test_indexer_leaves_index_consistent_on_keyboard_interrupt(tmp_path: Path) -
     assert repo.file_count == 0
     assert repo.chunk_count == 0
     assert storage.list_repo_file_paths(repo_id) == []
+
+
+def test_indexer_initializes_lsh_metadata_and_persists_chunk_bands(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.db"
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    (repo_path / "alpha.toml").write_text("key = 'alpha'\n", encoding="utf-8")
+
+    storage = TrackingStorage(db_path)
+    repo_id = storage.add_repo("repo", str(repo_path))
+    provider = FakeEmbeddingProvider()
+
+    assert storage.load_hyperplane_matrix() is None
+    assert storage.load_lsh_params() is None
+
+    indexer = Indexer(storage=storage, provider=provider, scanner=FileScanner(), chunker=Chunker())
+    first_matrix_blob = storage.load_hyperplane_matrix()
+
+    assert first_matrix_blob is not None
+    assert storage.load_lsh_params() == (indexer.lsh.num_bands, indexer.lsh.band_width)
+
+    result = indexer.index_repo(repo_id, repo_path)
+
+    reloaded = Indexer(storage=storage, provider=provider, scanner=FileScanner(), chunker=Chunker())
+
+    assert result.chunks_created == 1
+    assert result.lsh_seconds >= 0.0
+    assert _row_count(db_path, "chunk_bands") == indexer.lsh.num_bands
+    assert len(storage.inserted_chunk_bands) == 1
+    assert len(storage.inserted_chunk_bands[0][1]) == indexer.lsh.num_bands
+    assert storage.load_hyperplane_matrix() == first_matrix_blob
+    assert reloaded.lsh.dim == provider.dimensions()
+
+
+def test_indexer_deletes_chunk_bands_before_deleting_chunks_on_incremental_reindex(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "index.db"
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    alpha = repo_path / "alpha.toml"
+    beta = repo_path / "beta.toml"
+    alpha.write_text("key = 'alpha'\n", encoding="utf-8")
+    beta.write_text("key = 'beta'\n", encoding="utf-8")
+
+    storage = TrackingStorage(db_path)
+    repo_id = storage.add_repo("repo", str(repo_path))
+    provider = FakeEmbeddingProvider()
+    indexer = Indexer(storage=storage, provider=provider, scanner=FileScanner(), chunker=Chunker())
+
+    indexer.index_repo(repo_id, repo_path)
+    storage.events.clear()
+
+    alpha.write_text("key = 'alpha-updated'\n", encoding="utf-8")
+    os.utime(alpha, (200.0, 200.0))
+    beta.unlink()
+
+    indexer.index_repo(repo_id, repo_path)
+
+    assert storage.events[:2] == [
+        ("delete_chunk_bands_for_files", repo_id, ("alpha.toml", "beta.toml")),
+        ("delete_chunks_for_files", repo_id, ("alpha.toml", "beta.toml")),
+    ]
+    assert _row_count(db_path, "chunk_bands") == indexer.lsh.num_bands
+
+
+def test_indexer_full_reindex_regenerates_lsh_matrix_for_dimension_change(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.db"
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    (repo_path / "alpha.toml").write_text("key = 'alpha'\n", encoding="utf-8")
+
+    storage = TrackingStorage(db_path)
+    repo_id = storage.add_repo("repo", str(repo_path))
+    initial_provider = FakeEmbeddingProvider(dimensions=3)
+    initial_indexer = Indexer(
+        storage=storage,
+        provider=initial_provider,
+        scanner=FileScanner(),
+        chunker=Chunker(),
+    )
+
+    initial_indexer.index_repo(repo_id, repo_path)
+    original_matrix_blob = storage.load_hyperplane_matrix()
+    storage.events.clear()
+
+    updated_provider = FakeEmbeddingProvider(dimensions=4)
+    updated_indexer = Indexer(
+        storage=storage,
+        provider=updated_provider,
+        scanner=FileScanner(),
+        chunker=Chunker(),
+    )
+    with pytest.raises(DimensionMismatchError, match="Run index --full"):
+        updated_indexer.index_repo(repo_id, repo_path)
+
+    updated_matrix_blob = storage.load_hyperplane_matrix()
+
+    result = updated_indexer.index_repo(repo_id, repo_path, full=True)
+    final_matrix_blob = storage.load_hyperplane_matrix()
+
+    assert original_matrix_blob is not None
+    assert updated_matrix_blob == original_matrix_blob
+    assert final_matrix_blob is not None
+    assert final_matrix_blob != original_matrix_blob
+    assert updated_indexer.lsh._matrix.shape == (
+        updated_indexer.lsh.num_bands * updated_indexer.lsh.band_width,
+        4,
+    )
+    assert storage.events[:3] == [
+        ("clear_chunk_bands", 0, ()),
+        ("delete_chunk_bands_for_files", repo_id, ("alpha.toml",)),
+        ("delete_chunks_for_files", repo_id, ("alpha.toml",)),
+    ]
+    assert storage.get_meta("embedding_dimensions") == "4"
+    assert result.lsh_seconds >= 0.0
+    assert _row_count(db_path, "chunk_bands") == updated_indexer.lsh.num_bands
