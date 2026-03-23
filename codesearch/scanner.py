@@ -4,31 +4,17 @@ import os
 import subprocess
 from pathlib import Path
 
-SUPPORTED_EXTENSIONS = {
-    ".java",
-    ".kt",
-    ".py",
-    ".js",
-    ".ts",
-    ".tsx",
-    ".go",
-    ".rs",
-    ".rb",
-    ".php",
-    ".scala",
-    ".gradle",
-    ".xml",
-    ".yml",
-    ".yaml",
-    ".toml",
-    ".sql",
-    ".sh",
-    ".bash",
-    ".c",
-    ".cpp",
-    ".h",
-    ".hpp",
-    ".cs",
+BINARY_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg", ".tiff", ".tif",
+    ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav", ".flac", ".ogg", ".webm",
+    ".zip", ".gz", ".tar", ".bz2", ".xz", ".7z", ".rar", ".zst",
+    ".jar", ".war", ".ear", ".class",
+    ".exe", ".dll", ".so", ".dylib", ".o", ".a", ".lib",
+    ".pyc", ".pyo", ".whl", ".egg",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".ttf", ".otf", ".woff", ".woff2", ".eot",
+    ".bin", ".dat", ".db", ".sqlite", ".sqlite3",
+    ".DS_Store",
 }
 
 IGNORE_DIRS = {
@@ -44,6 +30,7 @@ IGNORE_DIRS = {
 }
 
 MAX_FILE_SIZE_BYTES = 100 * 1024
+_BINARY_PROBE_SIZE = 8192
 
 
 class FileScanner:
@@ -93,8 +80,19 @@ class FileScanner:
     def _should_include(self, file_path: Path) -> bool:
         if not file_path.is_file():
             return False
-        if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        if file_path.suffix.lower() in BINARY_EXTENSIONS:
             return False
         if any(part in IGNORE_DIRS for part in file_path.parts):
             return False
-        return file_path.stat().st_size <= MAX_FILE_SIZE_BYTES
+        if file_path.stat().st_size > MAX_FILE_SIZE_BYTES:
+            return False
+        return not self._looks_binary(file_path)
+
+    @staticmethod
+    def _looks_binary(file_path: Path) -> bool:
+        try:
+            with open(file_path, "rb") as fh:
+                chunk = fh.read(_BINARY_PROBE_SIZE)
+        except OSError:
+            return True
+        return b"\x00" in chunk

@@ -164,7 +164,7 @@ def test_indexer_full_reindexes_all_files(tmp_path: Path) -> None:
     assert storage.list_repos()[0].chunk_count == 2
 
 
-def test_indexer_warns_and_skips_binary_files(tmp_path: Path) -> None:
+def test_indexer_skips_binary_files(tmp_path: Path) -> None:
     repo_path = tmp_path / "repo"
     repo_path.mkdir()
     binary_file = repo_path / "binary.py"
@@ -175,8 +175,7 @@ def test_indexer_warns_and_skips_binary_files(tmp_path: Path) -> None:
     provider = FakeEmbeddingProvider()
     indexer = Indexer(storage=storage, provider=provider, scanner=FileScanner(), chunker=Chunker())
 
-    with pytest.warns(RuntimeWarning, match="Skipping binary.py"):
-        result = indexer.index_repo(repo_id, repo_path)
+    result = indexer.index_repo(repo_id, repo_path)
 
     assert result.files_indexed == 0
     assert result.chunks_created == 0
