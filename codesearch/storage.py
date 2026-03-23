@@ -731,6 +731,8 @@ class Storage:
             raise self._storage_error(exc, f"Failed to inspect index state: {exc}") from exc
         return row is not None and int(row["chunk_count"]) > 0
 
+    _SQLITE_VEC_KNN_LIMIT = 4096
+
     def _candidate_count(
         self,
         limit: int,
@@ -746,7 +748,7 @@ class Storage:
         except sqlite3.Error as exc:
             raise self._storage_error(exc, f"Failed to inspect index size: {exc}") from exc
         total = int(row["chunk_count"]) if row is not None else 0
-        return max(limit, total)
+        return min(max(limit, total), self._SQLITE_VEC_KNN_LIMIT)
 
     def _serialize_query_embedding(self, embedding: Sequence[float]) -> bytes:
         return self._sqlite_vec_serialize_float32()([float(value) for value in embedding])
