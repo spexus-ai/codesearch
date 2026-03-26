@@ -62,6 +62,7 @@ class Storage:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path).expanduser()
         self._initialized = False
+        self._conn: sqlite3.Connection | None = None
 
     @property
     def vector_backend(self) -> str:
@@ -620,6 +621,8 @@ class Storage:
             raise self._storage_error(exc, f"Failed to update repository stats: {exc}") from exc
 
     def _connect(self) -> sqlite3.Connection:
+        if self._conn is not None:
+            return self._conn
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             conn = sqlite3.connect(self.db_path)
@@ -637,7 +640,13 @@ class Storage:
         except sqlite3.Error as exc:
             conn.close()
             raise self._storage_error(exc, f"Failed to configure database connection: {exc}") from exc
+        self._conn = conn
         return conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
     def _ensure_initialized(self) -> None:
         if self._initialized:
