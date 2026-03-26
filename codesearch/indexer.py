@@ -87,8 +87,12 @@ class Indexer:
         repo_id: int,
         repo_path: Path,
         full: bool = False,
-        progress_callback: Callable[[int, int], None] | None = None,
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> IndexResult:
+        def _progress(phase: str, done: int, total: int) -> None:
+            if progress_callback is not None:
+                progress_callback(phase, done, total)
+
         repo_path = Path(repo_path).expanduser().resolve()
         if not repo_path.is_dir():
             raise StorageError(f"Repository directory not found: {repo_path}")
@@ -127,16 +131,14 @@ class Indexer:
             file_path = repo_path / relative_path
             if not file_path.exists():
                 files_done += 1
-                if progress_callback is not None:
-                    progress_callback(files_done, files_total)
+                _progress("chunk", files_done, files_total)
                 continue
             try:
                 file_chunks = self.chunker.chunk_file(file_path, repo_path)
             except ChunkerError as exc:
                 warnings.warn(f"Skipping {relative_path}: {exc}", RuntimeWarning, stacklevel=2)
                 files_done += 1
-                if progress_callback is not None:
-                    progress_callback(files_done, files_total)
+                _progress("chunk", files_done, files_total)
                 continue
             for chunk in file_chunks:
                 chunks.append(
@@ -152,19 +154,21 @@ class Indexer:
                 )
             files_indexed += 1
             files_done += 1
-            if progress_callback is not None:
-                progress_callback(files_done, files_total)
+            _progress("chunk", files_done, files_total)
         chunk_seconds = perf_counter() - chunk_started_at
 
         embed_started_at = perf_counter()
         embeddings: list[list[float]] = []
         total_chunks = len(chunks)
+        embedded_count = 0
         for start in range(0, total_chunks, EMBED_BATCH_SIZE):
             batch = chunks[start : start + EMBED_BATCH_SIZE]
             batch_embeddings = self.provider.embed([chunk.content for chunk in batch])
             if len(batch_embeddings) != len(batch):
                 raise StorageError("Embedding provider returned an unexpected number of vectors")
             embeddings.extend(batch_embeddings)
+            embedded_count += len(batch)
+            _progress("embed", embedded_count, total_chunks)
         embed_seconds = perf_counter() - embed_started_at
 
         lsh_started_at = perf_counter()
@@ -174,8 +178,11 @@ class Indexer:
         store_started_at = perf_counter()
         if chunks:
             chunk_ids = self.storage.insert_chunks(chunks, embeddings)
+            stored_count = 0
             for chunk_id, chunk_bands in zip(chunk_ids, band_hashes, strict=True):
                 self.storage.insert_chunk_bands(chunk_id, chunk_bands)
+                stored_count += 1
+                _progress("store", stored_count, len(chunk_ids))
         self.storage.refresh_repo(repo_id)
         store_seconds = perf_counter() - store_started_at
 
