@@ -77,13 +77,13 @@ def test_indexer_indexes_changed_files_in_batches_and_updates_storage(tmp_path: 
     storage = Storage(tmp_path / "index.db")
     repo_id = storage.add_repo("repo", str(repo_path))
     provider = FakeEmbeddingProvider()
-    progress_events: list[tuple[int, int]] = []
+    progress_events: list[tuple[str, int, int]] = []
     indexer = Indexer(storage=storage, provider=provider, scanner=FileScanner(), chunker=Chunker())
 
     result = indexer.index_repo(
         repo_id,
         repo_path,
-        progress_callback=lambda processed, total: progress_events.append((processed, total)),
+        progress_callback=lambda phase, processed, total: progress_events.append((phase, processed, total)),
     )
     repos = storage.list_repos()
 
@@ -96,7 +96,14 @@ def test_indexer_indexes_changed_files_in_batches_and_updates_storage(tmp_path: 
     assert result.store_seconds >= 0.0
     assert storage.get_meta("embedding_dimensions") == "3"
     assert [len(call) for call in provider.calls] == [32, 1]
-    assert progress_events == [(index, 33) for index in range(1, 34)]
+    chunk_events = [e for e in progress_events if e[0] == "chunk"]
+    embed_events = [e for e in progress_events if e[0] == "embed"]
+    store_events = [e for e in progress_events if e[0] == "store"]
+    assert chunk_events == [("chunk", index, 33) for index in range(1, 34)]
+    assert len(embed_events) == 2  # two batches: 32 + 1
+    assert embed_events[-1] == ("embed", 33, 33)
+    assert len(store_events) == 33
+    assert store_events[-1] == ("store", 33, 33)
     assert repos[0].file_count == 33
     assert repos[0].chunk_count == 33
     assert repos[0].indexed_at is not None

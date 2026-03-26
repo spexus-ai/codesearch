@@ -290,19 +290,31 @@ def index(target, full, show_status):
     chunker = Chunker()
     indexer = Indexer(storage=storage, provider=provider, scanner=scanner, chunker=chunker)
 
+    phase_labels = {
+        "chunk": "Chunking",
+        "embed": "Embedding",
+        "store": "Storing",
+    }
+
     for repo in selected:
         progress_bar = None
+        current_phase = None
         last_progress = 0
 
-        def progress_callback(done: int, total: int) -> None:
-            nonlocal progress_bar, last_progress
+        def progress_callback(phase: str, done: int, total: int) -> None:
+            nonlocal progress_bar, current_phase, last_progress
             if ctx.obj["quiet"] or not click.get_text_stream("stdout").isatty():
                 return
             if total <= 0:
                 return
-            if progress_bar is None:
-                progress_bar = click.progressbar(length=total, label=f"Indexing {repo.name}")
+            if phase != current_phase:
+                if progress_bar is not None:
+                    progress_bar.__exit__(None, None, None)
+                label = f"{phase_labels.get(phase, phase)} {repo.name}"
+                progress_bar = click.progressbar(length=total, label=label)
                 progress_bar.__enter__()
+                current_phase = phase
+                last_progress = 0
             progress_bar.update(done - last_progress)
             last_progress = done
 

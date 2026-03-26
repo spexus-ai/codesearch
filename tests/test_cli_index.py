@@ -135,7 +135,7 @@ def test_cli_index_uses_progress_bar_for_tty_stdout(tmp_path: Path, monkeypatch)
     db_path = tmp_path / "index.db"
     config_path = tmp_path / "config.toml"
     runner = CliRunner()
-    progress = {"length": None, "label": None, "updates": []}
+    bars: list[dict] = []
 
     class FakeStdout:
         def isatty(self) -> bool:
@@ -143,8 +143,7 @@ def test_cli_index_uses_progress_bar_for_tty_stdout(tmp_path: Path, monkeypatch)
 
     class FakeProgressBar:
         def __init__(self, *, length: int, label: str):
-            progress["length"] = length
-            progress["label"] = label
+            bars.append({"length": length, "label": label, "updates": []})
 
         def __enter__(self):
             return self
@@ -153,7 +152,7 @@ def test_cli_index_uses_progress_bar_for_tty_stdout(tmp_path: Path, monkeypatch)
             return False
 
         def update(self, amount: int) -> None:
-            progress["updates"].append(amount)
+            bars[-1]["updates"].append(amount)
 
     monkeypatch.setattr("codesearch.cli.create_provider", lambda config: KeywordProvider())
     monkeypatch.setattr("codesearch.cli.click.get_text_stream", lambda name: FakeStdout())
@@ -163,6 +162,9 @@ def test_cli_index_uses_progress_bar_for_tty_stdout(tmp_path: Path, monkeypatch)
     result = runner.invoke(cli, ["--db", str(db_path), "--config", str(config_path), "index", "repo-a"])
 
     assert result.exit_code == 0
-    assert progress["length"] == 2
-    assert progress["label"] == "Indexing repo-a"
-    assert progress["updates"] == [1, 1]
+    assert len(bars) == 3
+    assert bars[0]["label"] == "Chunking repo-a"
+    assert bars[0]["length"] == 2
+    assert bars[0]["updates"] == [1, 1]
+    assert bars[1]["label"] == "Embedding repo-a"
+    assert bars[2]["label"] == "Storing repo-a"
